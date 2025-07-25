@@ -1338,8 +1338,8 @@ class HierarchicalDROWithMultiScoring(nn.Module):
 
     def setup_multi_scoring(self, id_loader):
         """Setup multi-scoring framework after hierarchical DRO training"""
-        # Import your multi-scoring class
-        from your_multi_scoring_module import MultiScoreOODDetector
+        # Import the multi-scoring class
+        from multi_scoring import MultiScoreOODDetector
         
         self.multi_scorer = MultiScoreOODDetector(
             self.model, 
