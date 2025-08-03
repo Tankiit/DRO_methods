@@ -1,0 +1,24 @@
+# Requirements for Comprehensive CIFAR OOD Detection Analysis
+# Install with: pip install -r requirements_analysis.txt
+
+# Core ML Libraries
+torch>=1.9.0
+torchvision>=0.10.0
+timm>=0.6.0
+
+# Data Analysis and Visualization
+pandas>=1.3.0
+numpy>=1.21.0
+matplotlib>=3.4.0
+seaborn>=0.11.0
+scipy>=1.7.0
+
+# Progress Bars and Utilities
+tqdm>=4.62.0
+psutil>=5.8.0
+
+# Optional but recommended for better performance
+scikit-learn>=1.0.0
+
+# For improved plots (optional)
+plotly>=5.0.0 

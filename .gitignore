@@ -25,17 +25,19 @@ venv/
 ENV/
 env/
 .env/
+.venv/
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 
 # Jupyter Notebook
 .ipynb_checkpoints
 
-# Project specific
+# Project specific - Training artifacts
 checkpoints/
 results/
 runs/
@@ -44,15 +46,36 @@ runs/
 *.ckpt
 logs/
 wandb/
+*_results/
+eval_results_*/
 
-# Data
+# Data files - Large datasets
 data/
 datasets/
 *.npy
 *.npz
 *.h5
 *.pkl
+*.tar.gz
+*.zip
 
-# System
+# Log files
+*.log
+*.out
+*.err
+
+# Temporary and cache files
+.cache/
+temp/
+tmp/
+*.tmp
+
+# System files
 .DS_Store
-Thumbs.db 
+Thumbs.db
+*.bak
+*.swp
+
+# Personal/identifying information (add specific files if needed)
+personal_notes.txt
+author_info.txt

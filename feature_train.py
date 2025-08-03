@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
@@ -18,6 +18,8 @@ from collections import defaultdict
 import os
 import functools
 import traceback
+import pandas as pd
+import yaml
 
 class TimmFeatureExtractor(nn.Module):
     """Feature extractor based on timm models with separate backbone and classifier."""
@@ -55,66 +57,11 @@ class TimmFeatureExtractor(nn.Module):
         logits = self.classifier(features)
         return logits, features
 
-    def get_features(self, x, model):
+    def get_features(self, x):
         """Extract features from the model"""
-        if hasattr(model, 'get_features'):
-            # Use get_features method if available
-            return model.get_features(x)
-        elif hasattr(model, 'blocks'):
-            # For ViT models, use the output before the head
-            B = x.shape[0]
-            
-            # Get patch embeddings
-            x = model.patch_embed(x)  # Shape: B, N, D
-            
-            # Add CLS token
-            cls_tokens = model.cls_token.expand(B, -1, -1)  # Shape: B, 1, D
-            x = torch.cat((cls_tokens, x), dim=1)  # Shape: B, N+1, D
-            
-            # Add position embedding
-            if model.pos_embed is not None:
-                # Get the current sequence length (including CLS token)
-                curr_L = x.shape[1]
-                pos_L = model.pos_embed.shape[1]
-                
-                if curr_L != pos_L:
-                    # Need to interpolate position embeddings
-                    # First, remove CLS token embedding and reshape to 2D grid
-                    pos_embed = model.pos_embed
-                    cls_pos_embed = pos_embed[:, 0:1]
-                    pos_embed_grid = pos_embed[:, 1:].reshape(1, int((pos_L-1)**0.5), int((pos_L-1)**0.5), -1)
-                    
-                    # Interpolate grid to new size
-                    new_size = int((curr_L-1)**0.5)
-                    pos_embed_grid = torch.nn.functional.interpolate(
-                        pos_embed_grid.permute(0, 3, 1, 2),
-                        size=(new_size, new_size),
-                        mode='bicubic',
-                        align_corners=False
-                    ).permute(0, 2, 3, 1)
-                    
-                    # Flatten grid and add CLS token embedding back
-                    pos_embed_grid = pos_embed_grid.reshape(1, -1, pos_embed.shape[-1])
-                    pos_embed = torch.cat([cls_pos_embed, pos_embed_grid], dim=1)
-                    
-                    x = x + pos_embed
-                else:
-                    x = x + model.pos_embed
-            
-            x = model.pos_drop(x)
-            
-            # Apply transformer blocks
-            for block in model.blocks:
-                x = block(x)
-            
-            x = model.norm(x)
-            # Use CLS token features
-            features = x[:, 0]
-            return features
-        else:
-            # For other models, assume the forward pass returns (logits, features)
-            _, features = model(x)
-            return features
+        # Use the backbone to extract features
+        features = self.backbone(x)
+        return features
 
     def get_logits(self, features):
         """Utility method to get logits from features."""
@@ -191,9 +138,11 @@ class OptimizedHierarchicalDRO(nn.Module):
         
         # Initialize fast virtual generators
         self.fast_virtual_generator = FastVirtualGenerator(
-            radius=pixel_radius,
-            device=device
-        )
+            noise_scale=pixel_radius,  # Use pixel_radius for noise scale
+            adv_scale=pixel_radius,    # Use pixel_radius for adversarial scale
+            energy_temp=0.5            # Fixed energy temperature
+        ).to(device)
+        self.fast_virtual_generator.model = self.model  # Set model reference
         
         # Initialize energy-based components
         self.register_buffer('energy_temp', torch.tensor(0.5))
@@ -287,7 +236,7 @@ class OptimizedHierarchicalDRO(nn.Module):
             y_chunk = y[i:end_idx] if y is not None else None
             
             # Generate virtual samples for chunk
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 virtual_chunk = self.fast_virtual_generator.generate_fast_virtual_samples(
                     x_chunk, y_chunk, self.model
                 )
@@ -321,8 +270,11 @@ class FastVirtualGenerator(nn.Module):
     def get_features(self, x, model):
         """Extract features from the model"""
         if hasattr(model, 'get_features'):
-            # Use get_features method if available
+            # Use get_features method if available (single argument version)
             return model.get_features(x)
+        elif hasattr(model, 'backbone'):
+            # For TimmFeatureExtractor models
+            return model.backbone(x)
         elif hasattr(model, 'blocks'):
             # For ViT models, use the output before the head
             B = x.shape[0]
@@ -528,7 +480,7 @@ class PixelLevelVirtualGenerator(nn.Module):
                 y_chunk = y_subset[chunk_start:chunk_end] if y_subset is not None else None
                 
                 try:
-                    with torch.cuda.amp.autocast():  # Use mixed precision
+                    with torch.amp.autocast('cuda'):  # Use mixed precision
                         virtual_chunk = strategy(x_chunk, y_chunk, model)
                         chunk_results.append(virtual_chunk.detach())  # Detach to free memory
                         
@@ -546,7 +498,7 @@ class PixelLevelVirtualGenerator(nn.Module):
                                 if small_chunk.size(0) == 0:
                                     continue
                                 try:
-                                    with torch.cuda.amp.autocast():
+                                    with torch.amp.autocast('cuda'):
                                         virtual_small = strategy(small_chunk, y_chunk[:small_chunk.size(0)] if y_chunk is not None else None, model)
                                         chunk_results.append(virtual_small.detach())
                                 except Exception as e2:
@@ -599,7 +551,7 @@ class PixelLevelVirtualGenerator(nn.Module):
                 x_chunk = x[i:end_idx]
                 y_chunk = y[i:end_idx] if y is not None else None
                 try:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         adv_chunk = self._adversarial_perturbation(x_chunk, y_chunk, model)
                     chunks.append(adv_chunk)
                 except RuntimeError as e:
@@ -607,7 +559,7 @@ class PixelLevelVirtualGenerator(nn.Module):
                         # Try with even smaller chunk
                         for j in range(i, end_idx):
                             try:
-                                with torch.cuda.amp.autocast():
+                                with torch.amp.autocast('cuda'):
                                     adv_single = self._adversarial_perturbation(x[j:j+1], 
                                                                               y[j:j+1] if y is not None else None, 
                                                                               model)
@@ -624,7 +576,7 @@ class PixelLevelVirtualGenerator(nn.Module):
         
         for _ in range(3):  # 3 PGD steps
             try:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     logits, _ = model(x_adv)
                     id_logits = logits[:, :model.num_classes] if logits.size(1) > model.num_classes else logits
                     
@@ -978,21 +930,54 @@ class MultiLevelUncertaintyEstimator(nn.Module):
 # ============================================================================
 
 class HierarchicalDROWithMultiScoring(nn.Module):
-    def __init__(self, model, pixel_radius=0.03, feature_radius=0.1, pixel_weight=0.3, feature_weight=0.5, cross_weight=0.2, device='cuda'):
+    def __init__(self, 
+                 model,
+                 num_classes: int = 10,
+                 device: str = 'cpu',
+                 # Pixel-level parameters
+                 pixel_radius: float = 0.03,
+                 pixel_steps: int = 7,
+                 pixel_lr: float = 2e-3,
+                 # Feature-level parameters  
+                 feature_radius: float = 0.1,
+                 feature_steps: int = 5,
+                 feature_lr: float = 1e-2,
+                 # Loss weighting
+                 pixel_weight: float = 0.3,
+                 feature_weight: float = 0.5,
+                 cross_level_weight: float = 0.2):
+        
         super().__init__()
         self.model = model
+        self.num_classes = num_classes  # Store num_classes as instance attribute
         self.device = device
         
-        # Initialize loss weights as Parameters
-        self.pixel_weight = nn.Parameter(torch.tensor(pixel_weight))
-        self.feature_weight = nn.Parameter(torch.tensor(feature_weight))
-        self.cross_weight = nn.Parameter(torch.tensor(cross_weight))
-        
-        # Initialize radii
+        # Store hyperparameters
         self.pixel_radius = pixel_radius
+        self.pixel_steps = pixel_steps
+        self.pixel_lr = pixel_lr
         self.feature_radius = feature_radius
+        self.feature_steps = feature_steps
+        self.feature_lr = feature_lr
         
-        # Initialize virtual sample generator
+        # Initialize tensorboard writer and step counter
+        self.writer = None
+        self.global_step = 0
+        self.current_epoch = 0
+        
+        # Optimization settings
+        self.virtual_sample_frequency = 3  # Generate virtual samples every N steps
+        self.current_step = 0
+        self.batch_virtual_size = 4  # Size for batch processing virtual samples
+        self.enable_value_checks = False  # Disable expensive checks by default
+        self.log_value_ranges = False  # Disable expensive logging by default
+        
+        # Initialize loss weights as learnable parameters with constraints
+        self.pixel_weight = nn.Parameter(torch.tensor(pixel_weight).clamp(0.1, 0.5))
+        self.feature_weight = nn.Parameter(torch.tensor(feature_weight).clamp(0.1, 0.5))
+        self.cross_level_weight = nn.Parameter(torch.tensor(cross_level_weight).clamp(0.1, 0.5))
+        
+        # Initialize fast virtual generators
         self.fast_virtual_generator = FastVirtualGenerator(
             noise_scale=pixel_radius,  # Use pixel_radius for noise scale
             adv_scale=pixel_radius,    # Use pixel_radius for adversarial scale
@@ -1000,26 +985,15 @@ class HierarchicalDROWithMultiScoring(nn.Module):
         ).to(device)
         self.fast_virtual_generator.model = self.model  # Set model reference
         
-        # Initialize training hyperparameters
+        # Initialize energy-based components
+        self.register_buffer('energy_temp', torch.tensor(0.5))
+        
+        # Initialize loss scaling factors
+        self.register_buffer('loss_scale', torch.tensor(1.0))
         self.warmup_epochs = 5
-        self.virtual_sample_frequency = 5
-        self.batch_virtual_size = 4
-        self.current_step = 0
-        self.enable_value_checks = False
-        self.log_value_ranges = False
         
-        # Initialize tensorboard writer
-        self.writer = None
-        self.global_step = 0
-        
-        # Print initialization parameters
-        print("\nHierarchicalDRO Initialization:")
-        print(f"Warmup epochs: {self.warmup_epochs}")
-        print(f"Virtual sample frequency: {self.virtual_sample_frequency}")
-        print(f"Batch virtual size: {self.batch_virtual_size}")
-        print(f"Initial loss weights: pixel={pixel_weight:.3f}, feature={feature_weight:.3f}, cross={cross_weight:.3f}")
-        print(f"Energy temperature: {0.5:.3f}")
-        print(f"Initial loss scale: {1.000:.3f}")
+        # Progressive training state
+        self.training_config = {'use_virtual_samples': False, 'pixel_only': True}
     
     def forward(self, x, y):
         """Forward pass through the model and virtual generator"""
@@ -1035,7 +1009,7 @@ class HierarchicalDROWithMultiScoring(nn.Module):
         """Train the model using hierarchical DRO"""
         try:
             # Set up mixed precision if enabled
-            scaler = torch.cuda.amp.GradScaler() if getattr(self, 'mixed_precision', False) else None
+            scaler = torch.amp.GradScaler('cuda') if getattr(self, 'mixed_precision', False) else None
             
             # Update attributes from config
             if config:
@@ -1045,7 +1019,8 @@ class HierarchicalDROWithMultiScoring(nn.Module):
                 print(f"Setting gradient_accumulation_steps = {self.gradient_accumulation_steps}")
                 print(f"Setting grad_checkpoint = {self.grad_checkpoint}")
                 print(f"Setting empty_cache_freq = {self.empty_cache_freq}")
-                print(f"Setting ood_loader = {self.ood_loader}")
+                # self.ood_loader may not be set during the initial training phase; access it safely.
+                print(f"Setting ood_loader = {getattr(self, 'ood_loader', None)}")
             
             print("\nUsing ViT-specific learning rate schedule")
             
@@ -1078,7 +1053,7 @@ class HierarchicalDROWithMultiScoring(nn.Module):
             
             # DRO parameters (weights and virtual generators)
             dro_params = [
-                {'params': [self.pixel_weight, self.feature_weight, self.cross_weight], 'lr': lr * 0.01},
+                {'params': [self.pixel_weight, self.feature_weight, self.cross_level_weight], 'lr': lr * 0.01},
                 {'params': list(self.fast_virtual_generator.parameters()), 'lr': lr * 0.01}
             ]
             
@@ -1108,7 +1083,7 @@ class HierarchicalDROWithMultiScoring(nn.Module):
             )
             
             # Initialize mixed precision training
-            scaler = torch.cuda.amp.GradScaler() if getattr(self, 'mixed_precision', False) else None
+            scaler = torch.amp.GradScaler('cuda') if getattr(self, 'mixed_precision', False) else None
             
             best_loss = float('inf')
             best_val_loss = float('inf')
@@ -1199,7 +1174,7 @@ class HierarchicalDROWithMultiScoring(nn.Module):
                 
                 # Forward pass with mixed precision if enabled
                 if scaler is not None:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         results = self.fast_virtual_generator(data, targets)  # Use fast_virtual_generator directly
                         total_loss = results['total_loss']
                     
@@ -1361,7 +1336,8 @@ class HierarchicalDROWithMultiScoring(nn.Module):
         
         print("Evaluating hierarchical DRO model with multi-scoring...")
         
-        results = {}
+        # Initialize lists to store results for DataFrame
+        results_list = []
         
         # Evaluate on each OOD dataset
         for ood_name, ood_loader in ood_loaders.items():
@@ -1370,8 +1346,6 @@ class HierarchicalDROWithMultiScoring(nn.Module):
             # Get limited samples for efficiency
             id_data = self._get_limited_data(id_loader, max_samples=2000)
             ood_data = self._get_limited_data(ood_loader, max_samples=2000)
-            
-            ood_results = {}
             
             for method in tqdm(methods, desc=f'Computing scores for {ood_name}'):
                 try:
@@ -1386,17 +1360,34 @@ class HierarchicalDROWithMultiScoring(nn.Module):
                     
                     # Compute metrics
                     metrics = self._compute_detection_metrics(id_scores, ood_scores)
-                    ood_results[method] = metrics
+                    
+                    # Add results to list
+                    results_list.append({
+                        'ood_dataset': ood_name,
+                        'method': method,
+                        'auroc': metrics['auroc'],
+                        'fpr95': metrics['fpr95'],
+                        'separation': metrics['separation'],
+                        'id_mean_score': float(id_scores.mean()),
+                        'id_std_score': float(id_scores.std()),
+                        'ood_mean_score': float(ood_scores.mean()),
+                        'ood_std_score': float(ood_scores.std()),
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
                     
                     print(f"    {method}: AUROC={metrics['auroc']:.4f}, FPR@95%={metrics['fpr95']:.4f}")
                     
                 except Exception as e:
                     print(f"    Failed to compute {method}: {e}")
                     continue
-            
-            results[ood_name] = ood_results
         
-        return results
+        # Create DataFrame from results
+        results_df = pd.DataFrame(results_list)
+        
+        # Add summary statistics
+        summary_stats = results_df.groupby(['method'])[['auroc', 'fpr95']].agg(['mean', 'std']).round(4)
+        
+        return results_df, summary_stats
     
     def _get_limited_data(self, loader, max_samples=2000):
         """Get limited data for efficient evaluation"""
@@ -1441,13 +1432,61 @@ class HierarchicalDROWithMultiScoring(nn.Module):
                 self.writer.add_scalar(f'value_ranges/{key}_min', value.min().item(), self.global_step)
                 self.writer.add_scalar(f'value_ranges/{key}_max', value.max().item(), self.global_step)
 
+    def save_feature_stats_cache(self, cache_path: str):
+        """Save feature statistics cache to disk"""
+        cache_data = {}
+        for dataset_name, system in self.hierarchical_systems_cache.items():
+            # Save the essential statistics
+            cache_data[dataset_name] = {
+                'feature_mean': system.multi_scorer.feature_mean,
+                'feature_cov': system.multi_scorer.feature_cov,
+                'class_means': system.multi_scorer.class_means,
+                'class_covs': system.multi_scorer.class_covs,
+                'num_classes': system.num_classes
+            }
+        
+        torch.save(cache_data, cache_path)
+        print(f"Feature statistics cache saved to {cache_path}")
+    
+    def load_feature_stats_cache(self, cache_path: str) -> bool:
+        """Load feature statistics cache from disk"""
+        try:
+            if not os.path.exists(cache_path):
+                return False
+                
+            cache_data = torch.load(cache_path, map_location=self.device)
+            
+            for dataset_name, stats in cache_data.items():
+                # Create hierarchical system and populate with cached stats
+                hierarchical_system = HierarchicalDROWithMultiScoring(
+                    model=self.model,
+                    num_classes=stats['num_classes'],
+                    device=self.device
+                )
+                
+                # Populate cached statistics
+                hierarchical_system.multi_scorer.feature_mean = stats['feature_mean']
+                hierarchical_system.multi_scorer.feature_cov = stats['feature_cov']
+                hierarchical_system.multi_scorer.class_means = stats['class_means']
+                hierarchical_system.multi_scorer.class_covs = stats['class_covs']
+                
+                # Cache the hierarchical system
+                self.hierarchical_systems_cache[dataset_name] = hierarchical_system
+                
+            print(f"Successfully loaded feature statistics cache from {cache_path}")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to load cache from {cache_path}: {e}")
+            return False
+
 
 # Example usage of hierarchical pixel + feature level DRO
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--dataset', default='cifar10', choices=['cifar10','cifar100','imagenet'])
-    p.add_argument('--ood',     default='svhn',    choices=['svhn','cifar100','imagenet_a','imagenet_r','textures'])
+    p.add_argument('--ood',     default='svhn',help='Comma-separated list of OOD datasets, e.g. "cifar100,svhn,textures"')
     p.add_argument('--backbone','-b', default='resnet18', 
                   choices=['resnet18', 'resnet50', 'vit_base_patch16_224', 'vit_large_patch16_224', 
                           'dino_vits16', 'dino_vitb16'])
@@ -1507,12 +1546,14 @@ def get_imagenet_transform(train=True):
         transform = transforms.Compose([
             transforms.RandomResizedCrop(224),
             transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
             normalize
         ])
     else:
         transform = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
+            transforms.ToTensor(),
             normalize
         ])
     return transform
@@ -1529,39 +1570,53 @@ class FlatImageDataset(torch.utils.data.Dataset):
                           if f.lower().endswith(('.jpg', '.jpeg', '.png', '.JPEG'))]
         self.image_files.sort()  # Sort for reproducibility
         
+        print(f"Found {len(self.image_files)} images in {root_dir}")
+        
     def __len__(self):
         return len(self.image_files)
     
     def __getitem__(self, idx):
         img_name = os.path.join(self.root_dir, self.image_files[idx])
         
-        # Read image directly as tensor
-        image = torchvision.io.read_image(img_name)
-        
-        # Convert to float and scale to [0, 1]
-        image = image.float() / 255.0
-        
-        # Apply transforms
-        if self.transform is not None:
-            if isinstance(self.transform, transforms.Compose):
-                # Filter out ToTensor transform since we already have a tensor
-                tensor_transforms = transforms.Compose([
-                    t for t in self.transform.transforms 
-                    if not isinstance(t, transforms.ToTensor)
-                ])
-                image = tensor_transforms(image)
-            else:
-                image = self.transform(image)
-        
-        # Use -1 for OOD data, 0 otherwise
-        label = -1 if self.is_ood else 0
-        
-        return image, label
+        try:
+            # Read image directly as tensor
+            image = torchvision.io.read_image(img_name)
+            
+            # Handle grayscale images
+            if image.shape[0] == 1:
+                image = image.repeat(3, 1, 1)
+            
+            # Convert to float and scale to [0, 1]
+            image = image.float() / 255.0
+            
+            # Apply transforms
+            if self.transform is not None:
+                if isinstance(self.transform, transforms.Compose):
+                    # Filter out ToTensor transform since we already have a tensor
+                    tensor_transforms = transforms.Compose([
+                        t for t in self.transform.transforms 
+                        if not isinstance(t, transforms.ToTensor)
+                    ])
+                    image = tensor_transforms(image)
+                else:
+                    image = self.transform(image)
+            
+            # Use -1 for OOD data, 0 otherwise
+            label = -1 if self.is_ood else 0
+            
+            return image, label
+            
+        except Exception as e:
+            print(f"Error loading image {img_name}: {str(e)}")
+            # Return a black image and label on error
+            image = torch.zeros(3, 224, 224)
+            label = -1 if self.is_ood else 0
+            return image, label
 
 def get_dataset(name, data_dir, train=True, batch_size=128, is_ood=False):
     """Get dataset loader based on name.
     Args:
-        name: Dataset name (imagenet, cifar100, textures, svhn)
+        name: Dataset name (imagenet, cifar10, cifar100, textures, svhn)
         data_dir: Root directory for datasets
         train: Whether to load training set
         batch_size: Batch size for data loader
@@ -1628,26 +1683,162 @@ def get_dataset(name, data_dir, train=True, batch_size=128, is_ood=False):
                 persistent_workers=True
             )
             return (loader,)
+    
+    elif name == 'cifar10':
+        # Use ImageNet-style transforms for consistency, but resize CIFAR to 224x224
+        if train and not is_ood:
+            # Training transforms with data augmentation
+            train_transform = transforms.Compose([
+                transforms.Resize(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(10),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            val_transform = transforms.Compose([
+                transforms.Resize(224),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            
+            train_dataset = torchvision.datasets.CIFAR10(
+                root=os.path.join(data_dir, 'CIFAR10'),
+                train=True,
+                transform=train_transform,
+                download=True
+            )
+            val_dataset = torchvision.datasets.CIFAR10(
+                root=os.path.join(data_dir, 'CIFAR10'),
+                train=False,
+                transform=val_transform,
+                download=True
+            )
+            
+            print(f"Found {len(train_dataset)} CIFAR-10 training images")
+            print(f"Found {len(val_dataset)} CIFAR-10 validation images")
+            
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=4,
+                pin_memory=True,
+                prefetch_factor=2,
+                persistent_workers=True
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=4,
+                pin_memory=True,
+                prefetch_factor=2,
+                persistent_workers=True
+            )
+            
+            return train_loader, val_loader
+        else:
+            # Test set
+            transform = transforms.Compose([
+                transforms.Resize(224),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            dataset = torchvision.datasets.CIFAR10(
+                root=os.path.join(data_dir, 'CIFAR10'),
+                train=False,
+                transform=transform,
+                download=True
+            )
+            print(f"Found {len(dataset)} CIFAR-10 test images")
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=4,
+                pin_memory=True,
+                prefetch_factor=2,
+                persistent_workers=True
+            )
+            return (loader,)
             
     elif name == 'cifar100':
-        transform = get_imagenet_transform(train=False)  # Use ImageNet normalization
-        dataset = torchvision.datasets.CIFAR100(
-            root=os.path.join(data_dir, 'CIFAR100'),
-            train=train,
-            transform=transform,
-            download=True
-        )
-        print(f"Found {len(dataset)} CIFAR100 {'training' if train else 'test'} images")
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=train,
-            num_workers=4,
-            pin_memory=True,
-            prefetch_factor=2,
-            persistent_workers=True
-        )
-        return (loader,)
+        # Use ImageNet-style transforms for consistency, but resize CIFAR to 224x224
+        if train and not is_ood:
+            # Training transforms with data augmentation
+            train_transform = transforms.Compose([
+                transforms.Resize(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(10),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            val_transform = transforms.Compose([
+                transforms.Resize(224),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            
+            train_dataset = torchvision.datasets.CIFAR100(
+                root=os.path.join(data_dir, 'CIFAR100'),
+                train=True,
+                transform=train_transform,
+                download=True
+            )
+            val_dataset = torchvision.datasets.CIFAR100(
+                root=os.path.join(data_dir, 'CIFAR100'),
+                train=False,
+                transform=val_transform,
+                download=True
+            )
+            
+            print(f"Found {len(train_dataset)} CIFAR-100 training images")
+            print(f"Found {len(val_dataset)} CIFAR-100 validation images")
+            
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=4,
+                pin_memory=True,
+                prefetch_factor=2,
+                persistent_workers=True
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=4,
+                pin_memory=True,
+                prefetch_factor=2,
+                persistent_workers=True
+            )
+            
+            return train_loader, val_loader
+        else:
+            # Test set
+            transform = transforms.Compose([
+                transforms.Resize(224),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            dataset = torchvision.datasets.CIFAR100(
+                root=os.path.join(data_dir, 'CIFAR100'),
+                train=False,
+                transform=transform,
+                download=True
+            )
+            print(f"Found {len(dataset)} CIFAR-100 test images")
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=4,
+                pin_memory=True,
+                prefetch_factor=2,
+                persistent_workers=True
+            )
+            return (loader,)
         
     elif name == 'textures':
         transform = get_imagenet_transform(train=False)  # Use ImageNet normalization
@@ -1753,95 +1944,414 @@ def get_model(args):
     
     return model
 
+class DatasetConfig:
+    """Configuration class for dataset management"""
+    def __init__(self, name: str, data_dir: str, is_ood: bool = False):
+        self.name = name
+        self.data_dir = data_dir
+        self.is_ood = is_ood
+        self.transform = get_imagenet_transform(train=False)
+        
+        # Dataset specific settings
+        self.settings = {
+            'imagenet': {
+                'num_classes': 1000,
+                'size': 224,
+                'channels': 3,
+                'mean': [0.485, 0.456, 0.406],
+                'std': [0.229, 0.224, 0.225]
+            },
+            'cifar100': {
+                'num_classes': 100,
+                'size': 224,  # We resize to 224 for consistency
+                'channels': 3,
+                'mean': [0.485, 0.456, 0.406],  # Use ImageNet stats for consistency
+                'std': [0.229, 0.224, 0.225]
+            },
+            'cifar10': {
+                'num_classes': 10,
+                'size': 224,  # We resize to 224 for consistency
+                'channels': 3,
+                'mean': [0.485, 0.456, 0.406],  # Use ImageNet stats for consistency
+                'std': [0.229, 0.224, 0.225]
+            },
+            'svhn': {
+                'num_classes': 10,
+                'size': 224,  # We resize to 224 for consistency
+                'channels': 3,
+                'mean': [0.485, 0.456, 0.406],  # Use ImageNet stats for consistency
+                'std': [0.229, 0.224, 0.225]
+            },
+            'textures': {
+                'num_classes': 47,  # DTD has 47 texture categories
+                'size': 224,
+                'channels': 3,
+                'mean': [0.485, 0.456, 0.406],
+                'std': [0.229, 0.224, 0.225]
+            }
+        }
+
+def get_dataset_config(name: str, data_dir: str, is_ood: bool = False) -> DatasetConfig:
+    """Get dataset configuration"""
+    return DatasetConfig(name, data_dir, is_ood)
+
+class MultiDatasetEvaluator:
+    """Handles evaluation across multiple datasets"""
+    def __init__(self, 
+                 model: nn.Module,
+                 base_data_dir: str,
+                 device: str = 'cuda',
+                 batch_size: int = 32):
+        self.model = model
+        self.base_data_dir = Path(base_data_dir)
+        self.device = device
+        self.batch_size = batch_size
+        self.results_df = pd.DataFrame()
+        # Caching to avoid redundant computation
+        self.feature_stats_cache = {}
+        self.hierarchical_systems_cache = {}
+        self.data_loaders_cache = {}
+        
+    def evaluate_all_combinations(self, 
+                                id_datasets: List[str], 
+                                ood_datasets: List[str],
+                                methods: List[str] = None) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
+        """Evaluate all combinations of ID and OOD datasets"""
+        if methods is None:
+            methods = ['energy', 'mahalanobis', 'msp', 'odin', 'ensemble']
+        
+        all_results = []
+        summaries = {}
+        
+        for id_dataset in id_datasets:
+            print(f"\nEvaluating ID dataset: {id_dataset}")
+            id_config = get_dataset_config(id_dataset, self.base_data_dir)
+            
+            # Get ID data loader
+            id_loader = get_dataset(
+                id_config.name,
+                self.base_data_dir,
+                train=False,
+                batch_size=self.batch_size
+            )[0]
+            
+            for ood_dataset in ood_datasets:
+                if ood_dataset == id_dataset:
+                    continue
+                    
+                print(f"  Against OOD dataset: {ood_dataset}")
+                ood_config = get_dataset_config(ood_dataset, self.base_data_dir, is_ood=True)
+                
+                # Get OOD data loader
+                ood_loader = get_dataset(
+                    ood_config.name,
+                    self.base_data_dir,
+                    train=False,
+                    batch_size=self.batch_size,
+                    is_ood=True
+                )[0]
+                
+                # Evaluate this combination
+                results = self._evaluate_pair(
+                    id_loader=id_loader,
+                    ood_loader=ood_loader,
+                    id_name=id_dataset,
+                    ood_name=ood_dataset,
+                    methods=methods
+                )
+                all_results.extend(results)
+                
+                # Create summary for this pair
+                pair_df = pd.DataFrame(results)
+                summary = self._create_summary(pair_df)
+                summaries[f"{id_dataset}_vs_{ood_dataset}"] = summary
+        
+        # Create final DataFrame
+        final_df = pd.DataFrame(all_results)
+        
+        return final_df, summaries
+    
+    def _evaluate_pair(self,
+                      id_loader: DataLoader,
+                      ood_loader: DataLoader,
+                      id_name: str,
+                      ood_name: str,
+                      methods: List[str]) -> List[Dict[str, Any]]:
+        """Evaluate a single ID-OOD dataset pair"""
+        results = []
+        
+        # Check if we have cached hierarchical system for this ID dataset
+        if id_name not in self.hierarchical_systems_cache:
+            print(f"Computing feature statistics for {id_name} (first time)...")
+            # Setup multi-scoring
+            hierarchical_system = HierarchicalDROWithMultiScoring(
+                model=self.model,
+                num_classes=get_dataset_config(id_name, self.base_data_dir).settings[id_name]['num_classes'],
+                device=self.device
+            )
+            hierarchical_system.setup_multi_scoring(id_loader)
+            # Cache the system
+            self.hierarchical_systems_cache[id_name] = hierarchical_system
+        else:
+            print(f"Reusing cached feature statistics for {id_name}")
+            hierarchical_system = self.hierarchical_systems_cache[id_name]
+        
+        # Get limited samples
+        id_data = hierarchical_system._get_limited_data(id_loader, max_samples=2000)
+        ood_data = hierarchical_system._get_limited_data(ood_loader, max_samples=2000)
+        
+        for method in tqdm(methods, desc=f'Computing scores for {id_name} vs {ood_name}'):
+            try:
+                # Compute scores
+                if method == 'ensemble':
+                    id_scores, _, _ = hierarchical_system.multi_scorer.compute_ensemble_score(id_data)
+                    ood_scores, _, _ = hierarchical_system.multi_scorer.compute_ensemble_score(ood_data)
+                else:
+                    score_fn = getattr(hierarchical_system.multi_scorer, f'compute_{method}_score')
+                    id_scores = score_fn(id_data)
+                    ood_scores = score_fn(ood_data)
+                
+                # Compute metrics
+                metrics = hierarchical_system._compute_detection_metrics(id_scores, ood_scores)
+                
+                # Store results
+                results.append({
+                    'id_dataset': id_name,
+                    'ood_dataset': ood_name,
+                    'method': method,
+                    'auroc': metrics['auroc'],
+                    'fpr95': metrics['fpr95'],
+                    'separation': metrics['separation'],
+                    'id_mean_score': float(id_scores.mean()),
+                    'id_std_score': float(id_scores.std()),
+                    'ood_mean_score': float(ood_scores.mean()),
+                    'ood_std_score': float(ood_scores.std()),
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+                
+            except Exception as e:
+                print(f"    Failed to compute {method}: {e}")
+                continue
+        
+        return results
+    
+    def _create_summary(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create summary statistics for a results DataFrame"""
+        summary = df.groupby(['method'])[['auroc', 'fpr95', 'separation']].agg(['mean', 'std']).round(4)
+        return summary
+    
+    def save_results(self, 
+                    results_df: pd.DataFrame,
+                    summaries: Dict[str, pd.DataFrame],
+                    output_dir: str,
+                    model_name: str):
+        """Save all results and summaries"""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        save_dir = Path(output_dir) / f"multi_dataset_eval_{model_name}_{timestamp}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save detailed results
+        results_df.to_csv(save_dir / "detailed_results.csv", index=False)
+        results_df.to_excel(save_dir / "detailed_results.xlsx", index=False)
+        
+        # Save summaries
+        with pd.ExcelWriter(save_dir / "summaries.xlsx") as writer:
+            for name, summary in summaries.items():
+                summary.to_excel(writer, sheet_name=name[:31])  # Excel sheet name length limit
+                summary.to_csv(save_dir / f"summary_{name}.csv")
+        
+        # Save as JSON for compatibility - convert any non-serializable keys
+        try:
+            results_dict = {
+                'detailed_results': results_df.to_dict(orient='records'),
+                'summaries': {str(name): df.to_dict() for name, df in summaries.items()}
+            }
+            with open(save_dir / "results.json", "w") as f:
+                json.dump(results_dict, f, indent=4, default=str)
+        except Exception as e:
+            print(f"Warning: Could not save JSON results: {e}")
+            # Save a simplified version
+            simplified_dict = {
+                'detailed_results': results_df.to_dict(orient='records'),
+                'summary_info': f"Generated {len(results_df)} results across {len(summaries)} dataset pairs"
+            }
+            with open(save_dir / "results.json", "w") as f:
+                json.dump(simplified_dict, f, indent=4, default=str)
+        
+        print(f"\nResults saved to {save_dir}")
+        return save_dir
+
+    def load_feature_stats_cache(self, cache_path: str) -> bool:
+        """Load feature statistics cache from disk"""
+        try:
+            if not os.path.exists(cache_path):
+                return False
+                
+            cache_data = torch.load(cache_path, map_location=self.device)
+            
+            for dataset_name, stats in cache_data.items():
+                # Create hierarchical system and populate with cached stats
+                hierarchical_system = HierarchicalDROWithMultiScoring(
+                    model=self.model,
+                    num_classes=stats['num_classes'],
+                    device=self.device
+                )
+                
+                # Populate cached statistics
+                hierarchical_system.multi_scorer.feature_mean = stats['feature_mean']
+                hierarchical_system.multi_scorer.feature_cov = stats['feature_cov']
+                hierarchical_system.multi_scorer.class_means = stats['class_means']
+                hierarchical_system.multi_scorer.class_covs = stats['class_covs']
+                
+                # Cache the hierarchical system
+                self.hierarchical_systems_cache[dataset_name] = hierarchical_system
+                
+            print(f"Successfully loaded feature statistics cache from {cache_path}")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to load cache from {cache_path}: {e}")
+            return False
+    
+    def save_feature_stats_cache(self, cache_path: str):
+        """Save feature statistics cache to disk"""
+        cache_data = {}
+        for dataset_name, system in self.hierarchical_systems_cache.items():
+            # Save the essential statistics
+            cache_data[dataset_name] = {
+                'feature_mean': system.multi_scorer.feature_mean,
+                'feature_cov': system.multi_scorer.feature_cov,
+                'class_means': system.multi_scorer.class_means,
+                'class_covs': system.multi_scorer.class_covs,
+                'num_classes': system.num_classes
+            }
+        
+        torch.save(cache_data, cache_path)
+        print(f"Feature statistics cache saved to {cache_path}")
+
 def main():
-    # Parse arguments
     args = parse_args()
     
     # Set up logging and directories
     setup_logging_and_directories(args)
     
     # Get model
+    print("\nInitializing model...")
     model = get_model(args)
-    model = model.to('cuda')
+    # Note: Do NOT convert model to half precision manually when using mixed precision
+    # The autocast context manager will handle precision automatically
+    model = model.to('cuda', non_blocking=True)
     
-    # Print model summary
-    print("\nModel Architecture:")
-    print(model)
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nTotal Parameters: {total_params:,}")
-    print(f"Trainable Parameters: {trainable_params:,}")
+    # Training phase
+    if args.dataset in ['imagenet', 'cifar10', 'cifar100']:
+        print(f"\nPreparing {args.dataset.upper()} training...")
+        train_loader, val_loader = get_dataset(
+            args.dataset,
+            args.data_dir,
+            train=True,
+            batch_size=args.batch
+        )
+        
+        # Get number of classes based on dataset
+        num_classes_map = {'imagenet': 1000, 'cifar100': 100, 'cifar10': 10}
+        num_classes = num_classes_map[args.dataset]
+        
+        # Initialize hierarchical DRO system
+        print(f"\nInitializing Hierarchical DRO system for {args.dataset} ({num_classes} classes)...")
+        hierarchical_system = HierarchicalDROWithMultiScoring(
+            model=model,
+            num_classes=num_classes,
+            device='cuda'
+        )
+        
+        # Train the model
+        print("\nStarting training...")
+        hierarchical_system.train_hierarchical_dro(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            num_epochs=args.epochs,
+            lr=args.lr,
+            config={
+                'mixed_precision': args.mixed_precision,
+                'gradient_accumulation_steps': args.gradient_accumulation,
+                'grad_checkpoint': args.grad_checkpoint,
+                'empty_cache_freq': args.empty_cache_freq
+            },
+            checkpoint_dir=args.checkpoint_dir
+        )
+        
+        # Save final model
+        final_checkpoint = os.path.join(args.checkpoint_dir, f'final_model_{args.dataset}_{args.backbone}.pt')
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'args': vars(args)
+        }, final_checkpoint)
+        print(f"\nFinal model saved to {final_checkpoint}")
     
-    # Get data loaders
-    train_loader, val_loader = get_dataset(args.dataset, data_dir=args.data_dir, train=True, batch_size=args.batch)
-    ood_loader = get_dataset(args.ood, data_dir=args.data_dir, train=True, batch_size=args.batch, is_ood=True)[0]
-    
-    print(f"\nUsing {args.ood} as OOD data")
-    
-    # Initialize hierarchical DRO system
-    hierarchical_system = HierarchicalDROWithMultiScoring(
+    # Multi-dataset evaluation phase
+    print("\nStarting multi-dataset evaluation...")
+    evaluator = MultiDatasetEvaluator(
         model=model,
-        pixel_radius=args.pixel_radius,
-        feature_radius=args.feature_radius,
-        pixel_weight=args.pixel_weight,
-        feature_weight=args.feature_weight,
-        cross_weight=args.cross_weight,
-        device='cuda'
+        base_data_dir=args.data_dir,
+        device='cuda',
+        batch_size=args.batch
     )
     
-    # Create training config
-    config = {
-        'mixed_precision': args.mixed_precision,
-        'gradient_accumulation_steps': args.gradient_accumulation,
-        'grad_checkpoint': args.grad_checkpoint,
-        'empty_cache_freq': args.empty_cache_freq,
-        'ood_loader': ood_loader
-    }
+    # Try to load cached feature statistics
+    cache_path = os.path.join(args.output_dir, f'feature_stats_cache_{args.dataset}_{args.backbone}.pt')
+    cache_loaded = evaluator.load_feature_stats_cache(cache_path)
+    if cache_loaded:
+        print("Using cached feature statistics - this will save significant computation time!")
+    else:
+        print("No cached feature statistics found - will compute from scratch")
     
-    # Train the model
-    hierarchical_system.train_hierarchical_dro(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        num_epochs=args.epochs,
-        lr=args.lr,
-        config=config,
-        checkpoint_dir=args.checkpoint_dir
-    )
+    # Parse OOD datasets from comma-separated string
+    ood_datasets = args.ood.split(',') if args.ood else ['cifar100', 'svhn', 'textures']
     
-    # Step 2: Setup multi-scoring framework
-    print("\nSetting up multi-scoring framework...")
-    # Assuming id_test_loader is defined elsewhere or needs to be created
-    # For now, we'll create a dummy one if it's not available
-    if 'id_test_loader' not in locals():
-        id_test_loader = get_dataset(args.dataset, train=False, batch_size=args.batch, data_dir=args.data_dir)[0]
-    hierarchical_system.setup_multi_scoring(id_test_loader)
+    # Define evaluation datasets based on what we trained on
+    id_datasets = [args.dataset]  # Evaluate on the dataset we trained on
+    print(f"\nEvaluating on ID datasets: {id_datasets} (trained dataset)")
+    print(f"Testing against OOD datasets: {ood_datasets}")
     
-    # Step 3: Comprehensive evaluation
-    print("\nPerforming comprehensive evaluation...")
-    # Assuming ood_loaders is defined elsewhere or needs to be created
-    # For now, we'll create a dummy one if it's not available
-    if 'ood_loaders' not in locals():
-        ood_loaders = {
-            'cifar100': get_dataset('cifar100', train=False, batch_size=args.batch, data_dir=args.data_dir, is_ood=True)[0],
-            'svhn': get_dataset('svhn', train=False, batch_size=args.batch, data_dir=args.data_dir, is_ood=True)[0],
-            'imagenet_a': get_dataset('imagenet_a', train=False, batch_size=args.batch, data_dir=args.data_dir, is_ood=True)[0],
-            'imagenet_r': get_dataset('imagenet_r', train=False, batch_size=args.batch, data_dir=args.data_dir, is_ood=True)[0],
-            'textures': get_dataset('textures', train=False, batch_size=args.batch, data_dir=args.data_dir, is_ood=True)[0]
-        }
-    results = hierarchical_system.comprehensive_evaluation(
-        id_test_loader, 
-        ood_loaders,
+    # For CIFAR datasets, add other CIFAR datasets as potential OOD if not already included
+    if args.dataset == 'cifar10' and 'cifar100' not in ood_datasets:
+        ood_datasets.append('cifar100')
+    elif args.dataset == 'cifar100' and 'cifar10' not in ood_datasets:
+        ood_datasets.append('cifar10')
+    
+    print(f"Final OOD datasets: {ood_datasets}")
+    
+    # Run comprehensive evaluation
+    results_df, summaries = evaluator.evaluate_all_combinations(
+        id_datasets=id_datasets,
+        ood_datasets=ood_datasets,
         methods=['energy', 'mahalanobis', 'msp', 'odin', 'ensemble']
     )
     
-    # Save results
-    save_dir = Path(f"{args.output_dir}/{args.dataset}_{args.backbone}_{args.ood}")
-    save_dir.mkdir(parents=True, exist_ok=True)
+    # Save feature statistics cache for future runs
+    if not cache_loaded:  # Only save if we computed new statistics
+        evaluator.save_feature_stats_cache(cache_path)
+        print("Feature statistics cached for future runs!")
     
-    with open(save_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=4)
+    # Save evaluation results
+    save_dir = evaluator.save_results(
+        results_df=results_df,
+        summaries=summaries,
+        output_dir=args.output_dir,
+        model_name=f"{args.dataset}_{args.backbone}"
+    )
     
-    print(f"\nResults saved to {save_dir}/results.json")
+    # Print final summary
+    print("\nEvaluation Summary:")
+    print("\nAUROC Scores:")
+    auroc_summary = results_df.groupby(['id_dataset', 'ood_dataset', 'method'])['auroc'].mean().unstack()
+    print(auroc_summary.round(4))
+    
+    print("\nFPR@95 Scores:")
+    fpr_summary = results_df.groupby(['id_dataset', 'ood_dataset', 'method'])['fpr95'].mean().unstack()
+    print(fpr_summary.round(4))
+    
+    print(f"\nDetailed results saved to: {save_dir}")
 
 if __name__ == "__main__":
     main()
