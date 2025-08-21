@@ -711,26 +711,27 @@ if __name__ == "__main__":
     fixed = FixedCIFAR10Verifier(device='cpu')
     dbg=DebugCIFAR10Verifier(device='cpu')
 
-    # Optional: single image demo
-    if args.single:
-        transform = transforms.Compose([
+    # Define transform for single image demo
+    transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD)
     ])
     
-    testset = torchvision.datasets.CIFAR10(
-            root=args.data_root, train=False, download=(not args.no_download), transform=transform
-    )
-    
-    x, y = testset[0]
-    x = x.unsqueeze(0).to(fixed.device)
-    
-    print(f"\nVerifying CIFAR-10 image (class {y})...")
-    
-    stats = dbg.diagnose_model_stability(x)
-    report = fixed.verify_with_sanity_checks(x)
-    print(stats)
-    print(report)
+    # Optional: single image demo
+    if args.single:
+        testset = torchvision.datasets.CIFAR10(
+                root=args.data_root, train=False, download=(not args.no_download), transform=transform
+        )
+        
+        x, y = testset[0]
+        x = x.unsqueeze(0).to(fixed.device)
+        
+        print(f"\nVerifying CIFAR-10 image (class {y})...")
+        
+        stats = dbg.diagnose_model_stability(x)
+        report = fixed.verify_with_sanity_checks(x)
+        print(stats)
+        print(report)
     # print(f"Consistency factor: {consistency['consistency_factor']:.3f}")
     # print(f"Interpretation: {consistency['interpretation']}")
     
