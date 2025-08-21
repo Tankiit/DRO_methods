@@ -1051,6 +1051,12 @@ class HierarchicalDROWithMultiScoring(nn.Module):
                 })
                 print(f"head: {len(head_params)} tensors, {sum(p.numel() for p in head_params):,} parameters, lr={lr}")
             
+            # Fallback for non-ViT models (like ResNet)
+            if not model_params:
+                print("\nNo ViT-specific attributes found, using default parameter grouping")
+                model_params = [{"params": list(self.model.parameters()), "lr": lr}]
+                print(f"Default: {sum(p.numel() for p in self.model.parameters()):,} parameters, lr={lr}")
+            
             # DRO parameters (weights and virtual generators)
             dro_params = [
                 {'params': [self.pixel_weight, self.feature_weight, self.cross_level_weight], 'lr': lr * 0.01},
@@ -1076,7 +1082,7 @@ class HierarchicalDROWithMultiScoring(nn.Module):
                 max_lr=[g['lr'] for g in model_params],  # Different max LRs for each group
                 epochs=num_epochs, 
                 steps_per_epoch=len(train_loader),
-                pct_start=warmup_epochs/num_epochs,
+                pct_start=min(warmup_epochs/num_epochs, 0.8),
                 div_factor=25.0,
                 final_div_factor=1e4,
                 anneal_strategy='cos'
