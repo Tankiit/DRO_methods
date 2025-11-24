@@ -43,6 +43,15 @@ from nlp_datasets import (
     create_dataloaders,
     _generate_synthetic_wiki_text,
 )
+from nlp_dataset_loaders import (
+    load_dataset_by_name,
+    list_available_datasets,
+    get_dataset_info,
+    collate_fn,
+    LongDocumentDataset,
+    SyntheticLengthDataset,
+    DATASET_REGISTRY,
+)
 from transformer_lm import (
     TransformerConfig,
     TransformerLanguageModel,
@@ -93,10 +102,12 @@ class ExperimentConfig:
     max_grad_norm: float = 1.0
 
     # Data settings
-    dataset: str = "synthetic"  # synthetic, wikitext
+    dataset: str = "synthetic"  # synthetic, wikitext-2, wikitext-103, pg19, arxiv, etc.
     train_length_range: Tuple[int, int] = (512, 2048)
     num_train_samples: int = 10000
     num_eval_samples: int = 1000
+    cache_dir: str = "./data"
+    streaming: bool = False  # For large datasets like C4
 
     # DRO settings
     local_epsilon: float = 0.1
@@ -553,17 +564,12 @@ class HierarchicalDROExperiment:
 def create_datasets_and_loaders(config: ExperimentConfig) -> Tuple[DataLoader, Dict[str, DataLoader], TokenizerWrapper]:
     """Create datasets and dataloaders for experiments."""
     print("Creating tokenizer and datasets...")
+    print(f"Dataset: {config.dataset}")
 
     # Create tokenizer
     tokenizer = TokenizerWrapper("simple", vocab_size=config.vocab_size)
 
-    # Generate synthetic text for tokenizer fitting
-    synthetic_texts = _generate_synthetic_wiki_text(config.num_train_samples)
-    tokenizer.fit(synthetic_texts)
-
-    print(f"Tokenizer vocabulary size: {tokenizer.vocab_size}")
-
-    # Create length buckets
+    # Length buckets for evaluation
     length_buckets = [
         (64, 256),
         (256, 512),
@@ -573,53 +579,180 @@ def create_datasets_and_loaders(config: ExperimentConfig) -> Tuple[DataLoader, D
         (4096, 8192),
     ]
 
-    # Create training dataset
-    train_dataset = LengthGroupedDataset(
-        synthetic_texts[:config.num_train_samples],
-        tokenizer,
-        length_buckets=length_buckets,
-        max_length=config.max_seq_len,
-    )
+    # Load dataset based on configuration
+    if config.dataset == "synthetic":
+        # Generate synthetic text for tokenizer fitting
+        synthetic_texts = _generate_synthetic_wiki_text(config.num_train_samples)
+        tokenizer.fit(synthetic_texts)
 
-    print(f"Training dataset: {len(train_dataset)} samples")
-    print(f"Length distribution: {train_dataset.get_length_distribution()}")
+        print(f"Tokenizer vocabulary size: {tokenizer.vocab_size}")
 
-    # Create training dataloader with curriculum
-    train_sampler = LengthBucketSampler(
-        train_dataset,
-        batch_size=config.batch_size,
-        curriculum=config.use_curriculum,
-        curriculum_progress=config.curriculum_start_ratio if config.use_curriculum else 1.0,
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_sampler=train_sampler,
-        collate_fn=lambda b: collate_variable_length(b, tokenizer.pad_token_id),
-        num_workers=0,
-    )
-
-    # Create evaluation datasets for different length ranges
-    eval_texts = _generate_synthetic_wiki_text(config.num_eval_samples)
-    eval_loaders = {}
-
-    for min_len, max_len in length_buckets:
-        eval_dataset = LengthGroupedDataset(
-            eval_texts,
+        # Create training dataset
+        train_dataset = LengthGroupedDataset(
+            synthetic_texts[:config.num_train_samples],
             tokenizer,
-            length_buckets=[(min_len, max_len)],
-            max_length=max_len,
+            length_buckets=length_buckets,
+            max_length=config.max_seq_len,
         )
 
-        if len(eval_dataset) > 0:
-            eval_loader = DataLoader(
-                eval_dataset,
-                batch_size=config.batch_size,
-                collate_fn=lambda b: collate_variable_length(b, tokenizer.pad_token_id),
-                shuffle=False,
-                num_workers=0,
+        # Create evaluation texts
+        eval_texts = _generate_synthetic_wiki_text(config.num_eval_samples)
+
+    elif config.dataset in DATASET_REGISTRY:
+        # Use dataset loaders for real datasets
+        print(f"Loading {config.dataset} dataset...")
+        info = get_dataset_info(config.dataset)
+        print(f"  Description: {info.description}")
+        print(f"  Avg length: {info.avg_length} tokens")
+
+        # For real datasets, generate synthetic data for tokenizer fitting
+        # In practice, you'd use a pre-trained tokenizer (GPT-2, etc.)
+        synthetic_for_tokenizer = _generate_synthetic_wiki_text(5000)
+        tokenizer.fit(synthetic_for_tokenizer)
+
+        try:
+            train_dataset = load_dataset_by_name(
+                config.dataset,
+                tokenizer,
+                split="train",
+                max_length=config.max_seq_len,
+                max_samples=config.num_train_samples,
+                cache_dir=config.cache_dir,
+                streaming=config.streaming,
             )
-            eval_loaders[f'eval_{min_len}_{max_len}'] = eval_loader
+            print(f"Loaded training dataset: {len(train_dataset)} samples")
+            if hasattr(train_dataset, 'get_length_distribution'):
+                print(f"Length distribution: {train_dataset.get_length_distribution()}")
+
+            # Use same dataset for eval with different split
+            eval_texts = None  # Will use dataset directly
+        except Exception as e:
+            print(f"Warning: Could not load {config.dataset}: {e}")
+            print("Falling back to synthetic data...")
+            synthetic_texts = _generate_synthetic_wiki_text(config.num_train_samples)
+            tokenizer.fit(synthetic_texts)
+            train_dataset = LengthGroupedDataset(
+                synthetic_texts[:config.num_train_samples],
+                tokenizer,
+                length_buckets=length_buckets,
+                max_length=config.max_seq_len,
+            )
+            eval_texts = _generate_synthetic_wiki_text(config.num_eval_samples)
+    else:
+        raise ValueError(f"Unknown dataset: {config.dataset}. "
+                        f"Available: synthetic, {', '.join(DATASET_REGISTRY.keys())}")
+
+    print(f"Tokenizer vocabulary size: {tokenizer.vocab_size}")
+    print(f"Training dataset: {len(train_dataset)} samples")
+
+    # Create training dataloader with curriculum
+    if hasattr(train_dataset, 'length_to_indices'):
+        # LongDocumentDataset from nlp_dataset_loaders
+        from torch.utils.data import SubsetRandomSampler
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
+            shuffle=True,
+            num_workers=0,
+        )
+    else:
+        # LengthGroupedDataset from nlp_datasets
+        train_sampler = LengthBucketSampler(
+            train_dataset,
+            batch_size=config.batch_size,
+            curriculum=config.use_curriculum,
+            curriculum_progress=config.curriculum_start_ratio if config.use_curriculum else 1.0,
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_sampler,
+            collate_fn=lambda b: collate_variable_length(b, tokenizer.pad_token_id),
+            num_workers=0,
+        )
+
+    # Create evaluation dataloaders
+    eval_loaders = {}
+
+    if eval_texts is not None:
+        # Using synthetic eval texts
+        for min_len, max_len in length_buckets:
+            eval_dataset = LengthGroupedDataset(
+                eval_texts,
+                tokenizer,
+                length_buckets=[(min_len, max_len)],
+                max_length=max_len,
+            )
+
+            if len(eval_dataset) > 0:
+                eval_loader = DataLoader(
+                    eval_dataset,
+                    batch_size=config.batch_size,
+                    collate_fn=lambda b: collate_variable_length(b, tokenizer.pad_token_id),
+                    shuffle=False,
+                    num_workers=0,
+                )
+                eval_loaders[f'eval_{min_len}_{max_len}'] = eval_loader
+    else:
+        # Create eval loaders from real dataset validation split
+        try:
+            eval_dataset = load_dataset_by_name(
+                config.dataset,
+                tokenizer,
+                split="validation",
+                max_length=config.max_seq_len,
+                max_samples=config.num_eval_samples,
+                cache_dir=config.cache_dir,
+            )
+
+            # Create length-stratified eval loaders
+            if hasattr(eval_dataset, 'get_samples_by_length'):
+                for min_len, max_len in length_buckets:
+                    indices = eval_dataset.get_samples_by_length(min_len, max_len)
+                    if len(indices) > 0:
+                        subset = torch.utils.data.Subset(eval_dataset, indices)
+                        eval_loader = DataLoader(
+                            subset,
+                            batch_size=config.batch_size,
+                            collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
+                            shuffle=False,
+                            num_workers=0,
+                        )
+                        eval_loaders[f'eval_{min_len}_{max_len}'] = eval_loader
+            else:
+                # Single eval loader for all lengths
+                eval_loader = DataLoader(
+                    eval_dataset,
+                    batch_size=config.batch_size,
+                    collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
+                    shuffle=False,
+                    num_workers=0,
+                )
+                eval_loaders['eval_all'] = eval_loader
+
+        except Exception as e:
+            print(f"Warning: Could not load validation split: {e}")
+            # Fall back to using portion of train for eval
+            print("Using synthetic data for evaluation...")
+            eval_texts = _generate_synthetic_wiki_text(config.num_eval_samples)
+            for min_len, max_len in length_buckets:
+                eval_dataset = LengthGroupedDataset(
+                    eval_texts,
+                    tokenizer,
+                    length_buckets=[(min_len, max_len)],
+                    max_length=max_len,
+                )
+                if len(eval_dataset) > 0:
+                    eval_loader = DataLoader(
+                        eval_dataset,
+                        batch_size=config.batch_size,
+                        collate_fn=lambda b: collate_variable_length(b, tokenizer.pad_token_id),
+                        shuffle=False,
+                        num_workers=0,
+                    )
+                    eval_loaders[f'eval_{min_len}_{max_len}'] = eval_loader
 
     print(f"Created {len(eval_loaders)} evaluation dataloaders")
 
@@ -794,12 +927,38 @@ def main():
                        help='Evaluate every N steps')
     parser.add_argument('--use_curriculum', action='store_true',
                        help='Use curriculum learning')
+    parser.add_argument('--dataset', type=str, default='synthetic',
+                       help='Dataset to use (synthetic, wikitext-2, wikitext-103, pg19, arxiv, '
+                            'govreport, booksum, openwebtext, c4, scrolls-qasper, etc.)')
+    parser.add_argument('--cache_dir', type=str, default='./data',
+                       help='Cache directory for datasets')
+    parser.add_argument('--streaming', action='store_true',
+                       help='Use streaming mode for large datasets')
+    parser.add_argument('--list_datasets', action='store_true',
+                       help='List all available datasets and exit')
 
     args = parser.parse_args()
 
+    # List datasets if requested
+    if args.list_datasets:
+        print("\nAvailable Datasets for Length Generalization Experiments:")
+        print("=" * 70)
+        for name, info in DATASET_REGISTRY.items():
+            print(f"\n{name}:")
+            print(f"  Description: {info.description}")
+            print(f"  Avg Length: {info.avg_length:,} tokens")
+            print(f"  Max Length: {info.max_length:,} tokens")
+            print(f"  Domains: {', '.join(info.domains)}")
+            print(f"  Size: {info.download_size}")
+            if info.requires_auth:
+                print(f"  ⚠️  Requires authentication")
+        print("\n" + "=" * 70)
+        print("Usage: python run_nlp_experiments.py --dataset wikitext-103 --experiment hdro")
+        return
+
     # Create config
     config = ExperimentConfig(
-        experiment_name=f"nlp_hdro_{args.experiment}",
+        experiment_name=f"nlp_hdro_{args.experiment}_{args.dataset}",
         seed=args.seed,
         output_dir=args.output_dir,
         model_size=args.model_size,
@@ -813,6 +972,9 @@ def main():
         eval_every=args.eval_every,
         use_curriculum=args.use_curriculum,
         device=args.device or ('cuda' if torch.cuda.is_available() else 'cpu'),
+        dataset=args.dataset,
+        cache_dir=args.cache_dir,
+        streaming=args.streaming,
     )
 
     print("=" * 60)
@@ -820,6 +982,7 @@ def main():
     print("Hierarchical DRO for Robust Length Extrapolation")
     print("=" * 60)
     print(f"Device: {config.device}")
+    print(f"Dataset: {config.dataset}")
     print(f"Model size: {config.model_size}")
     print(f"Epochs: {config.num_epochs}")
     print(f"Batch size: {config.batch_size}")

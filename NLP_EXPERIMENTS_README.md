@@ -47,12 +47,60 @@ min_θ max_{P_L ∈ U_local} max_{P_C ∈ U_chunk} max_{P_G ∈ U_global} E[L_LM
     + λ_consistency * L_consistency
 ```
 
+## Available Datasets
+
+### Language Modeling Datasets
+| Dataset | Description | Avg Length | Max Length |
+|---------|-------------|------------|------------|
+| `synthetic` | Synthetic text for controlled experiments | Variable | 8K |
+| `wikitext-2` | Small Wikipedia (standard LM benchmark) | 500 | 4K |
+| `wikitext-103` | Large Wikipedia (103M tokens) | 3.5K | 16K |
+| `pg19` | Full books from Project Gutenberg | 70K | 500K |
+| `openwebtext` | Web text recreation | 800 | 8K |
+| `c4` | Colossal Clean Crawled Corpus | 500 | 8K |
+
+### Long Document Datasets
+| Dataset | Description | Avg Length | Max Length |
+|---------|-------------|------------|------------|
+| `arxiv` | Scientific papers from ArXiv | 8K | 50K |
+| `govreport` | Government reports | 9K | 50K |
+| `booksum` | Book chapter summarization | 5K | 30K |
+
+### Long-Context Benchmarks (SCROLLS)
+| Dataset | Description | Avg Length | Max Length |
+|---------|-------------|------------|------------|
+| `scrolls-qasper` | QA on scientific papers | 4.5K | 16K |
+| `scrolls-narrative_qa` | Story comprehension | 60K | 200K |
+| `scrolls-quality` | Multiple choice QA | 5K | 16K |
+
 ## Quick Start
+
+### List Available Datasets
+
+```bash
+python run_nlp_experiments.py --list_datasets
+```
 
 ### Run All Experiments
 
 ```bash
 python run_nlp_experiments.py --experiment all --model_size tiny --epochs 3
+```
+
+### Run with Specific Dataset
+
+```bash
+# Using WikiText-103
+python run_nlp_experiments.py --experiment hdro --dataset wikitext-103 --epochs 5
+
+# Using PG19 (long books)
+python run_nlp_experiments.py --experiment hdro --dataset pg19 --epochs 5 --max_seq_len 16384
+
+# Using ArXiv scientific papers
+python run_nlp_experiments.py --experiment hdro --dataset arxiv --epochs 5
+
+# Using SCROLLS benchmark
+python run_nlp_experiments.py --experiment hdro --dataset scrolls-qasper --epochs 5
 ```
 
 ### Run Specific Method
